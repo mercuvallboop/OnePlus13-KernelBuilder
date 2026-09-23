@@ -1,5 +1,5 @@
 {
-  "_comment": "Default commits resolved when no explicit branch/hash is supplied. Update these after verifying a build passes with a newer commit. The susfs pins are keyed per KSU variant because each flavor tracks the susfs sync at a different point. android15-6.6 KSU pin 937215c (susfs sync 'KernelSU: Sync with the official main repo') is dry-run-verified against KSU main 3497a56; the previous sync eba2a88 broke against 3497a56's allowlist refactor (run 33350609755, caught by the .rej fail-fast at minute 3).",
+  "_comment": "Default commits resolved when no explicit branch/hash is supplied. KSUN+SUSFS uses pershoot/KernelSU-Next dev-susfs, which is based on KernelSU-Next v3.4.0 and carries native SUSFS v2.3.0 integration. Plain KSUN continues to use the official dev pin.",
   "susfs": {
     "android12-5.10": {
       "KSU": "",
@@ -15,7 +15,7 @@
     },
     "android15-6.6": {
       "KSU": "937215cb3a1b1f333d764c366c7a49972fa8e7a0",
-      "KSUN": "be7b7ef49a1e1b189c3abf00eacaa7ebdb4168c1"
+      "KSUN": "9d9464f191b2d846590ac4d1b52e123df135c401"
     },
     "android16-6.12": {
       "KSU": "",
@@ -24,6 +24,7 @@
   },
   "ksu": {
     "main": "3497a56261564ee7fca494e3bfa0fac80118a34d",
-    "dev": "1a879d6a866f80b1fa1c1009a2ffa747873cbb5e"
+    "dev": "1a879d6a866f80b1fa1c1009a2ffa747873cbb5e",
+    "dev-susfs": "46c30a0249982970b22d09235ac2d46e9889cc52"
   }
 }
