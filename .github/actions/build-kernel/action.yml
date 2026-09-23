@@ -1222,16 +1222,21 @@ runs:
         esac
 
         cd "$COMMON_KERNEL_FOLDER"
-        if [ "${{ inputs.ksu_type }}" = "KSU" ] && [ -d "$KSU_FOLDER" ]; then
+        PATCHED_KSU_FOLDER=""
+        case "${{ inputs.ksu_type }}" in
+          KSU)  PATCHED_KSU_FOLDER="$KSU_FOLDER" ;;
+          KSUN) PATCHED_KSU_FOLDER="$KSUN_FOLDER" ;;
+        esac
+        if [ -n "$PATCHED_KSU_FOLDER" ] && [ -d "$PATCHED_KSU_FOLDER" ]; then
           # A half-applied SUSFS->KernelSU patch leaves the module un-buildable
           # (succeeded hunks drop Kbuild entries whose callers still exist),
-          # then Bazel dies at link with confusing errors an hour later.
-          # Detect rejects here at minute ~3 instead: fail fast with the list.
-          if REJ_LIST=$(find "$KSU_FOLDER" -name '*.rej' -type f | sort); then
+          # then the build dies later with confusing compile/link errors.
+          # Detect rejects immediately for both KSU and KernelSU-Next.
+          if REJ_LIST=$(find "$PATCHED_KSU_FOLDER" -name '*.rej' -type f | sort); then
             if [ -n "$REJ_LIST" ]; then
-              echo "::error::SUSFS KernelSU patch left rejects; KSU/SUSFS drifted apart:"
+              echo "::error::SUSFS patch left unresolved rejects for ${{ inputs.ksu_type }}:"
               echo "$REJ_LIST"
-              echo "Fix: update .github/compatible-commits.json to matching refs"
+              echo "Fix: update the matching KernelSU/SUSFS refs or compatibility patches"
               exit 1
             fi
           fi
