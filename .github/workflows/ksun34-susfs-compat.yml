@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/ksun34-susfs-compat.yml"
-      - "patches/ksun34/**"
   workflow_dispatch:
 
 permissions:
@@ -19,15 +18,12 @@ jobs:
       - name: Checkout builder
         uses: actions/checkout@v4
 
-      - name: Fetch pinned sources and probe SUSFS patch compatibility
+      - name: Probe KSUN v3.4.0 against current android15-6.6 SUSFS
         shell: bash
         run: |
           set -euo pipefail
 
           KSUN_COMMIT=1a879d6a866f80b1fa1c1009a2ffa747873cbb5e
-          SUSFS_COMMIT=be7b7ef49a1e1b189c3abf00eacaa7ebdb4168c1
-          WILDKERNELS_COMMIT=cd63f371d91fb7fc32014c75728fbb9b686d9ae9
-
           mkdir -p work diagnostics
 
           git init work/KernelSU-Next
@@ -35,85 +31,47 @@ jobs:
           git -C work/KernelSU-Next fetch --depth=1 origin "$KSUN_COMMIT"
           git -C work/KernelSU-Next checkout --detach FETCH_HEAD
 
-          git init work/susfs4ksu
-          git -C work/susfs4ksu remote add origin https://gitlab.com/simonpunk/susfs4ksu.git
-          git -C work/susfs4ksu fetch --depth=1 origin "$SUSFS_COMMIT"
-          git -C work/susfs4ksu checkout --detach FETCH_HEAD
+          git clone --depth=1 --branch gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git work/susfs4ksu
+          SUSFS_COMMIT="$(git -C work/susfs4ksu rev-parse HEAD)"
+          SUSFS_VERSION="$(grep '#define SUSFS_VERSION' work/susfs4ksu/kernel_patches/include/linux/susfs.h | awk -F'"' '{print $2}')"
 
-          git init work/kernel_patches
-          git -C work/kernel_patches remote add origin https://github.com/WildKernels/kernel_patches.git
-          git -C work/kernel_patches fetch --depth=1 origin "$WILDKERNELS_COMMIT"
-          git -C work/kernel_patches checkout --detach FETCH_HEAD
-
-          printf '%s\n'             "ksun=$KSUN_COMMIT"             "susfs=$SUSFS_COMMIT"             "wildkernels=$WILDKERNELS_COMMIT"             > diagnostics/pins.txt
+          printf '%s\n'             "ksun=$KSUN_COMMIT"             "susfs=$SUSFS_COMMIT"             "susfs_version=$SUSFS_VERSION"             > diagnostics/pins.txt
 
           cd work/KernelSU-Next
           set +e
           patch -p1 --forward < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch             > ../../diagnostics/base-patch.log 2>&1
-          base_status=$?
+          st=$?
           set -e
-
-          echo "Base patch exit: $base_status"
+          echo "patch_exit=$st" >> ../../diagnostics/pins.txt
           cat ../../diagnostics/base-patch.log
 
-          mapfile -t rejects < <(find kernel -name '*.rej' -type f | sort)
-          printf '%s\n' "${rejects[@]}" > ../../diagnostics/reject-list-before-fixes.txt
+          find kernel -name '*.rej' -type f | sort > ../../diagnostics/reject-list.txt
+          git diff -- kernel > ../../diagnostics/ksun-after-current-susfs.patch || true
 
-          for rej in "${rejects[@]}"; do
+          while IFS= read -r rej; do
             [ -n "$rej" ] || continue
-            base="$(basename "$rej" .rej)"
-            fix="../kernel_patches/next/susfs_fix_patches/v2.2.0/fix_${base}.patch"
             {
-              echo "===== $rej ====="
+              echo "===== reject: $rej ====="
               cat "$rej"
               echo
               echo "===== current source: ${rej%.rej} ====="
               cat "${rej%.rej}"
-              echo
             } > "../../diagnostics/$(echo "$rej" | tr '/' '_').txt"
+          done < ../../diagnostics/reject-list.txt
 
-            if [ -f "$fix" ]; then
-              echo "Applying existing fix: $fix"
-              if patch -p1 --forward < "$fix"; then
-                rm -f "$rej"
-              else
-                echo "Existing fix FAILED: $fix"
-              fi
-            else
-              echo "No existing fix for: $rej"
-            fi
-          done
-
-          # Apply the two generic v2.2.0 KSUN patches only after per-file fixes.
-          for extra in overwrite_hook_mode.patch ksu_toolkit.patch; do
-            p="../kernel_patches/next/susfs_fix_patches/v2.2.0/$extra"
-            if [ -f "$p" ]; then
-              echo "Applying $p"
-              set +e
-              patch -p1 --forward < "$p" > "../../diagnostics/${extra}.log" 2>&1
-              st=$?
-              set -e
-              echo "$extra exit: $st"
-              cat "../../diagnostics/${extra}.log"
-            fi
-          done
-
-          find kernel -name '*.rej' -type f | sort > ../../diagnostics/reject-list-after-fixes.txt
-
-          git diff -- kernel > ../../diagnostics/ksun-after-attempt.patch || true
-          cp kernel/Kbuild ../../diagnostics/Kbuild.after || true
-
+          echo "=== current SUSFS pin ==="
+          cat ../../diagnostics/pins.txt
           echo "=== unresolved rejects ==="
-          cat ../../diagnostics/reject-list-after-fixes.txt
+          cat ../../diagnostics/reject-list.txt
 
-          if [ -s ../../diagnostics/reject-list-after-fixes.txt ]; then
+          if [ "$st" -ne 0 ] || [ -s ../../diagnostics/reject-list.txt ]; then
             exit 2
           fi
 
-      - name: Upload compatibility diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ksun34-susfs-compat-diagnostics
+          name: ksun34-current-susfs-compat-diagnostics
           path: diagnostics/
           if-no-files-found: error
