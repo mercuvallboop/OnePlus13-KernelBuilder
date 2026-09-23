@@ -947,15 +947,37 @@ runs:
         cd "$KERNEL_PLATFORM_FOLDER"
         echo "Adding KernelSU Next..."
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
-        if [ -z "$KSU_INPUT" ]; then
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -
+        if [ "${{ env.OP_SUSFS }}" = true ]; then
+          # KSUN's generic SUSFS patch no longer applies cleanly to v3.4.0.
+          # Use the maintained dev-susfs integration, which is based on KSUN
+          # v3.4.0+ and carries the KernelSU-side SUSFS changes natively.
+          SETUP_URL="https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh"
+          echo "KSUN_SUSFS_NATIVE=true" >> "$GITHUB_ENV"
         else
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -s "$KSU_INPUT"
+          SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh"
+          echo "KSUN_SUSFS_NATIVE=false" >> "$GITHUB_ENV"
+        fi
+
+        if [ -z "$KSU_INPUT" ]; then
+          curl --fail --location --proto '=https' -LSs "$SETUP_URL" | bash -
+        else
+          curl --fail --location --proto '=https' -LSs "$SETUP_URL" | bash -s "$KSU_INPUT"
         fi
         git submodule update --init --recursive
         cd KernelSU-Next/kernel
 
-        COMMITS_COUNT=$(/usr/bin/git rev-list --count HEAD)
+        if [ "${{ env.OP_SUSFS }}" = true ]; then
+          # dev-susfs contains integration commits on top of pershoot/dev.
+          # Report the underlying KSUN driver version, not the fork-only
+          # compatibility commit count.
+          /usr/bin/git -C .. fetch --quiet origin dev:refs/remotes/origin/dev
+          BASE_COMMIT=$(/usr/bin/git -C .. merge-base HEAD refs/remotes/origin/dev)
+          COMMITS_COUNT=$(/usr/bin/git -C .. rev-list --count "$BASE_COMMIT")
+          KSU_TAG=$(/usr/bin/git -C .. describe --tags --abbrev=0 "$BASE_COMMIT" 2>/dev/null || echo v3.4.0)
+        else
+          COMMITS_COUNT=$(/usr/bin/git rev-list --count HEAD)
+          KSU_TAG=$(/usr/bin/git describe --tags --abbrev=0 HEAD 2>/dev/null || echo v0.0.1)
+        fi
 
         if [ $COMMITS_COUNT -lt 2684 ]; then
           BASE_VERSION=10200
@@ -968,11 +990,11 @@ runs:
         # KernelSU-Next moved version calculation from Makefile to Kbuild.
         # In Bazel/symlinked builds the git-root detection can fail, causing
         # KSU_VERSION to fall back to 1. Pin the values Kbuild will use.
-        awk -v count="$COMMITS_COUNT" '
+        awk -v count="$COMMITS_COUNT" -v tag="$KSU_TAG" '
           /^# Calculate version if git version is available$/ {
             print "# --- version injected by build pipeline ---"
             print "KSU_GIT_VERSION := " count
-            print "KSU_GIT_TAG := \"v0.0.1\""
+            print "KSU_GIT_TAG := \"" tag "\""
             print "KSU_GIT_VERSION_VALID := 1"
             print ""
           }
@@ -1198,22 +1220,19 @@ runs:
             fi
             ;;
           "v2.3.0")
-            # v2.3.0 synced with tiann/KernelSU main at 34a82ab7 (see the
-            # upstream "Bump version to 2.3.0" commit); verified to apply
-            # cleanly to KSU main HEAD 932014ab (one commit past the sync
-            # point). KSUN is NOT supported on this susfs version yet:
-            # upstream hunks still reject there and WildKernels' fix sets
-            # only go up to v2.2.0, so mixing a v2.3.0 base patch with the
-            # v2.2.0 fix set leaves the module half-patched (that is exactly
-            # what failed run 33287059782). Fail loudly instead. KSUN builds
-            # resolve the v2.2.0 ref via the variant-keyed pin in
-            # .github/compatible-commits.json.
             if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
-              echo "::error::SUSFS v2.3.0 does not support KernelSU-Next yet (WildKernels fix patches stop at v2.2.0). Use ksu_variant=KSU, or pin susfs_branch to a v2.2.0 commit."
-              exit 1
+              if [ "${KSUN_SUSFS_NATIVE:-false}" != true ]; then
+                echo "::error::SUSFS v2.3.0 with KSUN requires the native dev-susfs integration."
+                exit 1
+              fi
+              # pershoot/dev-susfs already contains the KernelSU-side v2.3.0
+              # integration. Do not apply the generic KSU patch a second time.
+              cd "$KSUN_FOLDER"
+              echo "KSUN dev-susfs already contains SUSFS v2.3.0 integration"
+            else
+              cd "$KSU_FOLDER"
+              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             fi
-            cd "$KSU_FOLDER"
-            patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             ;;
           *)
             echo "::error::Unsupported SUSFS version: $susfs_version"
