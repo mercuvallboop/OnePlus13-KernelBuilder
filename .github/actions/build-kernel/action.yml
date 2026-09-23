@@ -967,6 +967,34 @@ runs:
         cd KernelSU-Next/kernel
 
         if [ "${{ env.OP_SUSFS }}" = true ]; then
+          # pershoot/dev-susfs currently forward-declares the three
+          # security_*_with_policy helpers as static, while the android15-6.6
+          # SUSFS kernel patch calls them from security/selinux/*.c. That gives
+          # them internal linkage and the final vmlinux link fails with three
+          # undefined symbols. Remove only the erroneous storage class.
+          python3 - <<'PY'
+from pathlib import Path
+
+p = Path("feature/selinux_hide.c")
+s = p.read_text()
+targets = (
+    ("static int security_context_to_sid_with_policy(", "int security_context_to_sid_with_policy("),
+    ("static int security_sid_to_context_with_policy(", "int security_sid_to_context_with_policy("),
+    ("static void security_compute_av_user_with_policy(", "void security_compute_av_user_with_policy("),
+)
+
+changed = 0
+for old, new in targets:
+    if old in s:
+        s = s.replace(old, new, 1)
+        changed += 1
+    elif new not in s:
+        raise SystemExit(f"Expected declaration not found: {old}")
+
+p.write_text(s)
+print(f"Fixed KSUN with_policy linkage declarations: {changed} changed")
+PY
+
           # dev-susfs contains integration commits on top of pershoot/dev.
           # Report the underlying KSUN driver version, not the fork-only
           # compatibility commit count.
