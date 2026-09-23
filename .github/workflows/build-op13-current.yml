@@ -1,0 +1,523 @@
+name: Build OnePlus 13 Kernel - current KSUN SUSFS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-op13-current.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Plan build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Generate build matrix
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHOICE="6.6.89 A16"
+
+          case "$CHOICE" in
+            "6.6.89 A16")
+              CONFIGS='["configs/OP13-6.6.89.json"]'
+              ;;
+            "6.6.118 A16")
+              CONFIGS='["configs/OP13-6.6.118.json"]'
+              ;;
+            "6.6.142 A16")
+              CONFIGS='["configs/OP13-6.6.142.json"]'
+              ;;
+            "6.6.66 A15")
+              CONFIGS='["configs/OP13-6.6.66.json"]'
+              ;;
+            "6.6.30 A15")
+              CONFIGS='["configs/OP13-6.6.30.json"]'
+              ;;
+            "6.6.89 CPH A15")
+              CONFIGS='["configs/OP13-CPH-6.6.89.json"]'
+              ;;
+            "6.6.56 CPH A15")
+              CONFIGS='["configs/OP13-CPH-6.6.56.json"]'
+              ;;
+            "all")
+              CONFIGS='["configs/OP13-6.6.89.json","configs/OP13-6.6.118.json","configs/OP13-6.6.142.json","configs/OP13-6.6.66.json","configs/OP13-6.6.30.json","configs/OP13-CPH-6.6.89.json","configs/OP13-CPH-6.6.56.json"]'
+              ;;
+            *)
+              echo "::error::Unknown kernel_version choice: $CHOICE"
+              exit 1
+              ;;
+          esac
+
+          echo "matrix={\"config\":$CONFIGS}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: {\"config\":$CONFIGS}"
+
+          # Self-hosted runners must register with labels: self-hosted, linux, X64.
+          # The plan job always runs on GitHub-hosted (it's cheap), but it resolves
+          # the runner label once so every downstream job uses the same pool.
+          if [ "github-hosted" = "self-hosted" ]; then
+            echo 'runs_on=["self-hosted","linux","X64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.config }}
+    runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Clean workspace (self-hosted only)
+        if: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Self-hosted runners persist $GITHUB_WORKSPACE across runs. Stale
+          # kernel sources, toolchains, or ccache dirs from a previous variant
+          # can poison the next build (wrong defconfig, leftover .o files,
+          # mismatched modules.dep). Wipe it so every run starts fresh; the
+          # release-backed ccache restore repopulates what matters.
+          echo "Self-hosted runner detected — cleaning workspace"
+          if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
+            find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          fi
+          # The build action sets global git config (feature.manyFiles,
+          # core.fsmonitor, pack.sparse) that leak between unrelated repos
+          # on a persistent host. Unset them so the next repo gets defaults.
+          for key in feature.manyFiles core.fsmonitor pack.sparse; do
+            git config --global --unset "$key" 2>/dev/null || true
+          done
+          # Bazel's output base ($HOME/.cache/bazel) grows unbounded across
+          # runs and lives outside the workspace, so the wipe above never
+          # touches it. Run 33241700491 died with ENOSPC exactly because of
+          # this. Prune output bases not touched in the last 7 days; the
+          # release-backed disk cache makes the content recoverable.
+          if [ -d "$HOME/.cache/bazel" ]; then
+            find "$HOME/.cache/bazel" -mindepth 1 -maxdepth 1 -type d -mtime +7 \
+              -exec rm -rf {} + 2>/dev/null || true
+          fi
+
+      - name: Checkout builder
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            aria2 git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 python-is-python3 python3-requests \
+            ccache jq bc dos2unix kmod libdw-dev elfutils pigz zstd
+          sudo apt-get clean
+
+      - name: Check free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail fast with an actionable message instead of dying mid-build
+          # with ENOSPC (which also kills the runner's own log writer and
+          # produces an undebuggable run — see run 33241700491).
+          df -h
+          avail_kb=$(df -Pk "${GITHUB_WORKSPACE:-.}" | awk 'NR==2 {print $4}')
+          avail_gib=$((avail_kb / 1024 / 1024))
+          if [ "${RUNNER_ENVIRONMENT:-}" = "github-hosted" ]; then
+            # Hosted VMs ship ~35-45 GiB free and that has been enough; only
+            # warn so a shrinking image never hard-breaks the default path.
+            if [ "$avail_gib" -lt 30 ]; then
+              echo "::warning::Only ${avail_gib} GiB free on hosted runner — builds have worked at this level, but watch for ENOSPC."
+            fi
+            exit 0
+          fi
+          # Self-hosted: thresholds are variant-aware. Non-DDK variants peak
+          # around 50 GiB (source + toolchain + ccache + outputs). The Bazel
+          # DDK variants (6.6.118/142) need ~150 GiB on top of that — a 100 GB disk
+          # physically cannot fit one, so reject it up front with the reason
+          # instead of burning an hour and dying in a cryptic ENOSPC.
+          if [ "$(jq -r '.ddk // false' "$GITHUB_WORKSPACE/${{ matrix.config }}")" = "true" ]; then
+            min_gib=150
+            hint="DDK variant needs ~150 GiB free (Bazel output base dominates). Expand the host volume or use a larger runner."
+          else
+            min_gib=50
+            hint="Prune on the host: ~/.cache/bazel, old _work dirs, docker leftovers."
+          fi
+          if [ "$avail_gib" -lt "$min_gib" ]; then
+            echo "::error::Only ${avail_gib} GiB free — need ${min_gib} GiB. ${hint}"
+            exit 1
+          fi
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          CACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+          mkdir -p "$CACHE_DIR"
+          {
+            echo "CCACHE_DIR=$CACHE_DIR"
+            echo "CCACHE_LOGFILE=$GITHUB_WORKSPACE/ccache.log"
+            echo "CCACHE_MAXSIZE=12G"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_COMPRESSION=true"
+            echo "CCACHE_COMPRESSION_LEVEL=3"
+            echo "CCACHE_DIRECT=true"
+            echo "CCACHE_FILE_CLONE=true"
+            echo "CCACHE_INODE_CACHE=true"
+            echo "CCACHE_IS_KERNEL_COMPILING=true"
+            echo "CCACHE_UMASK=002"
+            echo "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare configuration
+        id: config
+        shell: bash
+        env:
+          USE_SUSFS: true
+          USE_OPT_PATCHES: true
+          LTO_MODE: thin
+          COMPILER_MODE: zycromerz-19
+          KERNEL_UNAME: OP-WILD
+          NETHUNTER: true
+          WIRELESS_MODULES: true
+          DDK: true
+          DDK_INJECTION: true
+        run: |
+          set -euo pipefail
+          if [ "$COMPILER_MODE" = manifest ]; then
+            zyc_compiler=''
+          else
+            zyc_compiler=$(jq -r '.zyc_compiler' "${{ matrix.config }}")
+          fi
+
+          # The DDK inputs can only turn a variant's DDK build off, never on:
+          # only manifests carrying the Kleaf/Bazel projects can build it, and
+          # only OP13-6.6.118/OP13-6.6.142 do today. Forcing it on elsewhere
+          # would fail during Bazel's load phase with a far less obvious error.
+          config_ddk=$(jq -r '.ddk // false' "${{ matrix.config }}")
+          if [ "$config_ddk" != "true" ]; then
+            ddk=false
+            ddk_injection=false
+          else
+            ddk="$DDK"
+            if [ "$ddk" = "true" ]; then
+              ddk_injection="$DDK_INJECTION"
+            else
+              ddk_injection=false
+            fi
+          fi
+
+          config_json=$(jq -c \
+            --argjson susfs "$USE_SUSFS" \
+            --argjson opt "$USE_OPT_PATCHES" \
+            --argjson nethunter "$NETHUNTER" \
+            --argjson wireless_modules "$WIRELESS_MODULES" \
+            --argjson ddk "$ddk" \
+            --argjson ddk_injection "$ddk_injection" \
+            --arg lto "$LTO_MODE" \
+            --arg zyc "$zyc_compiler" \
+            --arg uname "$KERNEL_UNAME" \
+            '.susfs = $susfs | .opt = $opt | .nethunter = $nethunter | .wireless_modules = $wireless_modules | .ddk = $ddk | .ddk_injection = $ddk_injection | .lto = $lto | .zyc_compiler = $zyc | .uname = $uname' \
+            "${{ matrix.config }}")
+          echo "config_json=$config_json" >> "$GITHUB_OUTPUT"
+          jq . <<< "$config_json"
+
+      - name: Resolve KernelSU ref
+        id: ksu
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KSU_VARIANT: KSUN
+          KSU_BRANCH: 
+          USE_SUSFS: true
+        run: |
+          set -euo pipefail
+          if [ "$KSU_VARIANT" = KSUN ] && [ "$USE_SUSFS" = true ]; then
+            # pershoot/dev-susfs tracks KernelSU-Next and carries the maintained
+            # KSUN-specific SUSFS integration, avoiding stale generic patch hunks.
+            owner=pershoot; name=KernelSU-Next; default_ref=dev-susfs
+          elif [ "$KSU_VARIANT" = KSUN ]; then
+            owner=KernelSU-Next; name=KernelSU-Next; default_ref=dev
+          else
+            owner=tiann; name=KernelSU; default_ref=main
+          fi
+
+          # Prefer the last known-good commit for this variant so SUSFS and KernelSU
+          # stay in sync. Falls back to the branch HEAD when no compatible commit is
+          # recorded, allowing users to opt into latest by passing a branch name.
+          compatible_commit=$(jq -r --arg ref "$default_ref" '.ksu[$ref] // empty' .github/compatible-commits.json)
+          if [ -n "${KSU_BRANCH:-}" ]; then
+            ref="$KSU_BRANCH"
+          elif [ -n "$compatible_commit" ]; then
+            ref="$compatible_commit"
+            echo "ℹ️ Using compatible KernelSU commit for $KSU_VARIANT ($default_ref): $ref"
+          else
+            ref="$default_ref"
+            echo "ℹ️ No compatible commit recorded; using KernelSU branch: $ref"
+          fi
+
+          query='query($owner: String!, $name: String!, $headRef: String!, $tagRef: String!, $objRef: String!) {
+            repository(owner: $owner, name: $name) {
+              hb: ref(qualifiedName: $headRef) { t: target { ... on Commit { o: oid } } }
+              ht: ref(qualifiedName: $tagRef) { t: target { ... on Commit { o: oid } } }
+              ho: object(expression: $objRef) { ... on Commit { o: oid } }
+            }
+          }'
+
+          resolved=unknown
+          for attempt in 1 2 3; do
+            if result=$(gh api graphql -f query="$query" -f owner="$owner" -f name="$name" \
+                  -f headRef="refs/heads/$ref" -f tagRef="refs/tags/$ref" -f objRef="$ref" 2>/dev/null) \
+               && [ -n "$result" ]; then
+              resolved=$(jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")' <<< "$result")
+              break
+            fi
+            echo "::warning::GitHub API call failed (attempt $attempt/3); retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$resolved" = unknown ] || [ -z "$resolved" ]; then
+            echo "::error::Could not resolve $KSU_VARIANT ref '$ref' in $owner/$name"
+            exit 1
+          fi
+
+          echo "Resolved $KSU_VARIANT ref '$ref' -> $resolved"
+          echo "ref=$resolved" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve SUSFS ref
+        id: susfs
+        shell: bash
+        env:
+          SUSFS_BRANCH_INPUT: 
+          KSU_VARIANT: KSUN
+        run: |
+          set -euo pipefail
+          android_version=$(jq -r '.android_version' "${{ matrix.config }}")
+          kernel_version=$(jq -r '.kernel_version' "${{ matrix.config }}")
+          kernel_key="$android_version-$kernel_version"
+
+          declare -A DEFAULT_SUSFS_BRANCHES=(
+            ["android12-5.10"]="gki-android12-5.10"
+            ["android13-5.15"]="gki-android13-5.15"
+            ["android14-6.1"]="gki-android14-6.1"
+            ["android15-6.6"]="gki-android15-6.6"
+            ["android16-6.12"]="gki-android16-6.12"
+          )
+          default_branch="${DEFAULT_SUSFS_BRANCHES[$kernel_key]:-gki-android15-6.6}"
+
+          # Prefer the last known-good commit for this GKI version so builds stay
+          # green when upstream SUSFS introduces incompatible changes. The mapping
+          # lives in .github/compatible-commits.json and can be updated whenever a
+          # newer compatible commit is verified. Pins are keyed by KSU variant:
+          # the susfs patch set must match the flavor it patches (KSU main is
+          # synced at v2.3.0; KSUN dev + WildKernels fix sets target v2.2.0).
+          # A plain-string pin is still honored for both variants.
+          compatible_commit=$(jq -r --arg key "$kernel_key" --arg variant "$KSU_VARIANT" '
+            .susfs[$key] as $pin |
+            if ($pin | type) == "object" then ($pin[$variant] // "")
+            elif ($pin | type) == "string" then $pin
+            else "" end' .github/compatible-commits.json)
+          if [ -n "$SUSFS_BRANCH_INPUT" ]; then
+            ref="$SUSFS_BRANCH_INPUT"
+          elif [ -n "${compatible_commit:-}" ]; then
+            ref="$compatible_commit"
+            echo "ℹ️ Using compatible SUSFS commit for $kernel_key: $ref"
+          else
+            ref="$default_branch"
+            echo "ℹ️ No compatible commit recorded; using SUSFS branch: $ref"
+          fi
+
+          echo "Resolving SUSFS ref '$ref' for $kernel_key"
+          query='query($ref: String!) { project(fullPath: "simonpunk/susfs4ksu") { repository { commit(ref: $ref) { sha } } } }'
+
+          resolved=unknown
+          for attempt in 1 2 3; do
+            if response=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$query" --data-urlencode "variables={\"ref\":\"$ref\"}" 2>/dev/null) && [ -n "$response" ]; then
+              sha=$(jq -r '.data.project.repository.commit.sha // empty' <<< "$response")
+              if [ -n "$sha" ]; then
+                resolved="$sha"
+                break
+              fi
+            fi
+            echo "::warning::GitLab API call failed (attempt $attempt/3); retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$resolved" = unknown ] || [ -z "$resolved" ]; then
+            echo "::error::Could not resolve SUSFS ref '$ref' for $kernel_key"
+            exit 1
+          fi
+
+          echo "Resolved SUSFS ref '$ref' -> $resolved"
+          echo "ref=$resolved" >> "$GITHUB_OUTPUT"
+
+      - name: Build kernel
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.config.outputs.config_json }}
+          ksu_type: KSUN
+          ksu_branch_or_hash: ${{ steps.ksu.outputs.ref }}
+          susfs_commit_hash_or_branch: ${{ steps.susfs.outputs.ref }}
+          build_timestamp: 
+          optimize_level: O2
+          clean: false
+          debug: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  firmware:
+    name: Nethunter Wireless Firmware
+    runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
+    # `needs: plan` is mandatory, not ordering sugar: job outputs are only
+    # readable from jobs that declare the producer as a direct dependency.
+    # Without it `needs.plan.outputs.runs_on` is '' and fromJSON('') aborts
+    # the run before any step executes.
+    needs: plan
+    if: true
+    steps:
+      - name: Download latest Nethunter firmware
+        id: fetch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Fetching latest nullptr-t-oss/Nethunter-Wireless-Firmware release"
+
+          RELEASE_JSON=$(gh api repos/nullptr-t-oss/Nethunter-Wireless-Firmware/releases/latest)
+          TAG=$(jq -r '.tag_name' <<< "$RELEASE_JSON")
+          ASSET_URL=$(jq -r '.assets[0].browser_download_url' <<< "$RELEASE_JSON")
+          ASSET_NAME=$(jq -r '.assets[0].name' <<< "$RELEASE_JSON")
+
+          echo "Latest release: $TAG"
+          echo "Asset: $ASSET_NAME"
+          echo "URL: $ASSET_URL"
+
+          curl -fsSL -o "$ASSET_NAME" "$ASSET_URL"
+
+          SHA256=$(sha256sum "$ASSET_NAME" | awk '{print $1}')
+          echo "SHA256: $SHA256"
+
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.fetch.outputs.asset_name }}
+          path: ${{ steps.fetch.outputs.asset_name }}
+          archive: false
+          compression-level: 0
+          retention-days: 90
+
+  release:
+    name: Create release
+    runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
+    # `plan` is listed explicitly even though build/firmware already depend on
+    # it: GitHub Actions does not surface outputs through transitive needs, so
+    # `needs.plan.outputs.runs_on` would be empty with only [build, firmware].
+    needs: [plan, build, firmware]
+    if: false
+    steps:
+      # v8 is required, not v7: the build job uploads the ZIPs with
+      # `archive: false`, and only v8 checks Content-Type before trying to
+      # unzip a raw (already-zipped-by-us) download.
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+
+      - name: Collect release files
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+
+          # Artifacts uploaded with `archive: false` land as
+          # release-artifacts/<artifact-name>/<file-name>. Flatten them,
+          # copying any file that matches a release artifact pattern.
+          find release-artifacts -type f \
+            \( -name 'AK3_*.zip' -o -name 'kernel_modules_*.zip' \
+               -o -name 'Nethunter-Wireless-Firmware*.zip' \) \
+            -exec cp -n -- {} release-files/ \;
+
+          echo "Release files:"
+          ls -la release-files/
+
+          if [ -z "$(ls -A release-files)" ]; then
+            echo "::error::No release files were collected"
+            exit 1
+          fi
+
+      - name: Prepare release body
+        id: body
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo 'body<<RELEASE_BODY_EOF'
+            echo "OnePlus 13 kernel builds for OxygenOS 15/16."
+            echo
+            echo "**Build configuration:**"
+            echo
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| KernelSU variant | KSUN |"
+            echo "| SUSFS | true |"
+            echo "| Nethunter inline configs | true |"
+            echo "| Wireless modules | true |"
+            echo "| Optimization | O2 |"
+            echo "| LTO | thin |"
+            echo "| Compiler source | zycromerz-19 |"
+            echo "| Variants | 6.6.89 A16 |"
+            echo
+            echo "**Artifacts (SHA256):**"
+            echo
+            for f in release-files/*; do
+              printf -- '- `%s`\n  - `%s`\n' "$(basename "$f")" "$(sha256sum "$f" | awk '{print $1}')"
+            done
+            echo
+            echo "---"
+            echo
+            echo "Flash the \`AK3_*.zip\` for your exact kernel version in a custom recovery or with the KernelSU/KSU-Next flasher."
+            echo
+            echo "\`kernel_modules_*.zip\` holds the external Wi-Fi/CAN drivers (ath9k_htc, ath10k, mt76, rtw88, rt2800usb, zd1211rw, p54, carl9170, slcan, …) built as loadable modules."
+            echo "They are built with \`CONFIG_MODVERSIONS=y\`, so a module ZIP is valid **only** for the exact matching kernel build in this same release."
+            echo "OnePlus's stock mac80211 lacks symbols these drivers need, so unload the stock stack first and \`insmod\` the bundled \`cfg80211.ko\`/\`mac80211.ko\` before the driver — see EmberHeart's \`docs/drivers.md\`."
+            echo
+            echo "\`Nethunter-Wireless-Firmware*.zip\` is re-published unmodified from [nullptr-t-oss/Nethunter-Wireless-Firmware](https://github.com/nullptr-t-oss/Nethunter-Wireless-Firmware)."
+            echo
+            echo "This repository does not build \`boot.img\`, \`vendor_boot.img\`, \`vendor_dlkm.img\`, or \`system_dlkm.img\`."
+            echo 'RELEASE_BODY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: op13-${{ github.run_number }}
+          name: OnePlus 13 Build ${{ github.run_number }}
+          generate_release_notes: false
+          prerelease: false
+          body: ${{ steps.body.outputs.body }}
+          files: release-files/*
