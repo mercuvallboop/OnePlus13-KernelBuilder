@@ -376,9 +376,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KSU_VARIANT: ${{ inputs.ksu_variant }}
           KSU_BRANCH: ${{ inputs.ksu_branch }}
+          USE_SUSFS: ${{ inputs.use_susfs }}
         run: |
           set -euo pipefail
-          if [ "$KSU_VARIANT" = KSUN ]; then
+          if [ "$KSU_VARIANT" = KSUN ] && [ "$USE_SUSFS" = true ]; then
+            # pershoot/dev-susfs tracks KernelSU-Next and carries the maintained
+            # KSUN-specific SUSFS integration, avoiding stale generic patch hunks.
+            owner=pershoot; name=KernelSU-Next; default_ref=dev-susfs
+          elif [ "$KSU_VARIANT" = KSUN ]; then
             owner=KernelSU-Next; name=KernelSU-Next; default_ref=dev
           else
             owner=tiann; name=KernelSU; default_ref=main
